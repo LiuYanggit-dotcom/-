@@ -1,0 +1,356 @@
+//serial_port.cpp
+#include <ros/ros.h>
+#include <serial/serial.h>
+#include <iostream>
+#include <vector>
+#include<ros/time.h>
+#include<sensor_msgs/Imu.h>
+#include <tf/transform_broadcaster.h>
+
+using std::vector;
+
+uint16_t calcCRC(const uint8_t  *pBuffer, uint16_t bufferSize);
+void decode_frame(vector<uint8_t> new_buffer, uint8_t *data_buffer);
+void dump_imu570_data(uint8_t *data_buffer, float *imu_data);
+// void decode_str(std::string new_buffer, std::string data_buffer);
+
+// 计算imu570得crc校验位
+// int main(int argc, char** argv)
+// {
+//     // 计算crc校验位
+//     uint8_t data[6]={0x53,0x00,0x03,0x00,0x01,0xC8};
+//     uint16_t crc = calcCRC(data, 6);
+//     //16进制的方式打印到屏幕
+//     std::cout << std::hex << crc << " ";
+// }
+
+int main(int argc, char** argv)
+{
+    ros::init(argc, argv, "serial_port");
+    //创建句柄（虽然后面没用到这个句柄，但如果不创建，运行时进程会出错）
+    ros::NodeHandle n;
+
+    // create topic's publisher of imu 
+    ros::Publisher imu_pub = n.advertise<sensor_msgs::Imu>("imu_raw", 20);
+    
+    //创建一个serial类
+    serial::Serial sp;
+    //创建timeout
+    serial::Timeout to = serial::Timeout::simpleTimeout(10);
+    //设置要打开的串口名称
+    sp.setPort("/dev/ttyUSB0");
+    //设置串口通信的波特率
+    sp.setBaudrate(115200);
+    //串口设置timeout
+    sp.setTimeout(to);
+ 
+    try
+    {
+        //打开串口
+        sp.open();
+    }
+    catch(serial::IOException& e)
+    {
+        ROS_ERROR_STREAM("Unable to open imu");
+        return -1;
+    }
+    
+    //判断串口是否打开成功
+    if(sp.isOpen())
+    {
+        ROS_INFO_STREAM("/dev/ttyUSB0 is opened.");
+    }
+    else
+    {
+        return -1;
+    }
+    
+    // //创建一个serial类
+    // serial::Serial rtk;
+    // //创建timeout
+    // to = serial::Timeout::simpleTimeout(10);
+    // //设置要打开的串口名称
+    // rtk.setPort("/dev/ttyUSB1");
+    // //设置串口通信的波特率
+    // rtk.setBaudrate(115200);
+    // //串口设置timeout
+    // rtk.setTimeout(to);
+
+    // try
+    // {
+    //     //打开串口
+    //     rtk.open();
+    // }
+    // catch(serial::IOException& e)
+    // {
+    //     ROS_ERROR_STREAM("Unable to open rtk.");
+    //     return -1;
+    // }
+    
+    // //判断串口是否打开成功
+    // if(rtk.isOpen())
+    // {
+    //     ROS_INFO_STREAM("/dev/ttyUSB1 is opened.");
+    // }
+    // else
+    // {
+    //     return -1;
+    // }
+
+    ros::Rate loop_rate(100);
+    
+    // //定义rtk读取标志位
+    // uint8_t flag = 0;
+    
+    while(ros::ok())
+    {        
+        //获取缓冲区内的字节数
+        size_t n = sp.available();
+
+        if(n!=0)
+        {
+            uint8_t buffer[n]; //串口缓冲区
+            uint8_t data[36];  //imu原始有效数据,包含36个字节的初始信息
+            float imu_data[9]; //解析后的roll、pitch、yaw等
+
+            //读出数据
+            n = sp.read(buffer, n);
+            
+            std::vector<uint8_t> vec_buffer(buffer, buffer + sizeof(buffer)/sizeof(buffer[0]));
+            decode_frame(vec_buffer, data);
+            // 从初始信息解析roll等
+            dump_imu570_data(data, imu_data);
+            
+            //publish imu topic
+            sensor_msgs::Imu imu_raw;
+            imu_raw.header.stamp = ros::Time::now();
+            imu_raw.header.frame_id = "base_link";
+            imu_raw.orientation = tf::createQuaternionMsgFromRollPitchYaw(imu_data[0], imu_data[0], imu_data[0]);
+            imu_raw.angular_velocity.x = imu_data[3]; 
+            imu_raw.angular_velocity.y = imu_data[4]; 
+            imu_raw.angular_velocity.z = imu_data[5];
+            imu_raw.linear_acceleration.x = imu_data[6]; 
+            imu_raw.linear_acceleration.y = imu_data[7];
+            imu_raw.linear_acceleration.z = imu_data[8];
+
+            imu_pub.publish(imu_raw);
+            
+            // 16进制的方式打印初始信息
+            // for(int i=0; i<36; i++)
+            // {    
+            //     std::cout << std::hex << (data[i] & 0xff) << " ";
+            // }
+
+            // 打印roll等信息
+            // std::cout << "roll: " << imu_data[0]<< "   "<< "pitch: " << imu_data[1]<< "   ";
+            // std::cout << std::endl;
+        }
+
+       // flag++;
+        // //读取rtk串口数据
+        // if(flag/20)
+        // {   
+        //     flag = 0;
+        //     //获取缓冲区内的字节数
+        //     size_t n = rtk.available();
+        //     if(n!=0)
+        //     {
+        //         static std::string rtk_buffer;
+        //         // std::string rtk_data;
+        //         rtk_buffer = rtk.read(n);
+        //         std::cout<< rtk_buffer << std::endl;
+        //         // decode_str(rtk_buffer, rtk_data);
+
+        //     }
+        //}
+
+        loop_rate.sleep();
+    }
+    
+    //关闭串口
+    sp.close();
+    //rtk.close();
+ 
+    return 0;
+}
+
+void dump_imu570_data(uint8_t *recvbuf, float *imu_data){
+    uint8_t k;
+    unsigned char c_roll[4], c_pitch[4], c_yaw[4];
+	unsigned char c_gx[4], c_gy[4], c_gz[4];
+	unsigned char c_ax[4], c_ay[4], c_az[4];
+
+    for (k = 0; k < 4; k++)
+		c_roll[k] = recvbuf[k];
+	imu_data[0] = *((float*)(c_roll));  //得到roll角度值,单位是rad
+    
+	for (k = 0; k < 4; k++)
+		c_pitch[k] = recvbuf[4 + k];
+	imu_data[1] = *((float*)(c_pitch));  //得到pitch角度值
+
+	for (k = 0; k < 4; k++)
+		c_yaw[k] = recvbuf[8 + k];
+	imu_data[2] = *((float*)(c_yaw));  //得到yaw角度值
+
+		for (k = 0; k < 4; k++)
+			c_gx[k] = recvbuf[12 + k];
+	imu_data[3] = *((float*)(c_gx));  //得到gx,单位是rad/s
+
+		for (k = 0; k < 4; k++)
+			c_gy[k] = recvbuf[16 + k];
+	imu_data[4] = *((float*)(c_gy));  //得到gy
+
+		for (k = 0; k < 4; k++)
+			c_gz[k] = recvbuf[20 + k];
+	imu_data[5] = *((float*)(c_gz));  //得到gz
+
+		for (k = 0; k < 4; k++)
+			c_ax[k] = recvbuf[24 + k];
+	imu_data[6] = *((float*)(c_ax));  //得到ax,单位是m/s2
+
+		for (k = 0; k < 4; k++)
+			c_ay[k] = recvbuf[28 + k];
+	imu_data[7] = *((float*)(c_ay));  //得到ay
+
+		for (k = 0; k < 4; k++)
+			c_az[k] = recvbuf[32 + k];
+	imu_data[8] = *((float*)(c_az));  //得到az
+}
+
+uint16_t calcCRC(const uint8_t  *pBuffer, uint16_t bufferSize)
+{
+	uint16_t poly = 0x8408;
+	uint16_t crc = 0;
+	uint8_t carry; uint8_t i_bits;
+	uint16_t j;
+	for (j = 0; j < bufferSize; j++)
+	{
+		crc = crc ^ pBuffer[j];
+		for (i_bits = 0; i_bits < 8; i_bits++)
+		{
+			carry = crc & 1;
+			crc = crc / 2;
+			if (carry)
+			{
+				crc = crc ^ poly;
+			}
+		}
+	}
+	return crc;
+}
+//rtk_buffer数据防丢失
+// void decode_str(std::string new_buffer, std::string data_buffer)
+// {
+//     static std::string strRece;
+//     strRece += new_buffer;
+//     std::string gstart = "$GPGGA";
+//     std::string gend = "\r\n";
+//     int i=0, start=-1, end=-1;
+//     while(i<strRece.length())
+//     {   //寻找起始标志
+//         start = strRece.find(gstart);
+//         //如果没找到，则丢弃
+//         if (start==-1)
+//         {
+//             if (strRece.length() > 2)   
+//                 strRece = strRece.substr(strRece.length()-3);
+//                 break;
+//         }
+
+//         else
+//         {
+//             end = strRece.find(gend);
+//             if (end == -1)
+//             {
+//                 if (end != 0)
+//                 strRece = strRece.substr(start);
+//                 break;
+//             }
+//             else
+//             {
+//                 data_buffer = strRece.substr(start, end);
+//             }
+//         }
+
+//     }
+// }
+void decode_frame(vector<uint8_t> new_buffer, uint8_t *data_buffer)
+{
+    static size_t protocol_len = 44; //一个完整帧的长度
+    static vector<uint8_t> last_remaining_buffer;
+    vector<uint8_t> cat_buffer; //cat_buffer是空的，本周期操作的buffer
+
+    cat_buffer.insert(cat_buffer.end(),last_remaining_buffer.begin(),last_remaining_buffer.end()); //将last_remaining_buffer压入
+    cat_buffer.insert(cat_buffer.end(),new_buffer.begin(),new_buffer.end()); //继续将new_buffer压入
+    
+    //拼接后buffer内数据的总长度
+    size_t data_len = cat_buffer.size();
+    
+    // buffer小于包头的长度，将最后两个字节数据保留，防止漏掉帧头
+    if(data_len < 5){
+        last_remaining_buffer.clear();
+        last_remaining_buffer.insert(last_remaining_buffer.end(), cat_buffer.begin(), cat_buffer.end());
+        return ;
+    }
+
+    int i = 0;
+    int j = 0;
+    int index=0;
+
+    // 找包头
+    for(i; i < data_len-5; i++){
+        if(cat_buffer[i] ==0xFF && cat_buffer[i+1] == 0x02 && cat_buffer[i+2] == 0x90 && cat_buffer[i+3] == 0x00 && cat_buffer[i+4] == 0x24){
+            if(data_len - i + 1 >= protocol_len){// 判断是否存在完整帧
+                
+                // CRC校验
+                uint16_t poly = 0x8408;
+	            uint16_t crc = 0;
+	            uint8_t carry; uint8_t i_bits;
+	            uint16_t j;
+                size_t bufferSize = 39;
+	            for (j = 0; j < bufferSize; j++)
+	            {
+		            crc = crc ^ cat_buffer[i+2+j];
+		            for (i_bits = 0; i_bits < 8; i_bits++)
+		            {
+			            carry = crc & 1;
+			            crc = crc / 2;
+			            if (carry)
+			            {
+				            crc = crc ^ poly;
+			            }
+		            }
+	            }
+                uint16_t d = (cat_buffer[i+41] << 8) | cat_buffer[i+42];
+
+
+                // 根据包头确定校验位和包尾是否符合协议满足协议要求
+                if(crc == d){
+                    //将有效信息传递给data_buffer
+                    for (int j = 0; j < 36; j++) {
+                        data_buffer[j] = cat_buffer[i + j + 5]; // 将cat_buffer中索引为i+5至i+41处的值赋值给pBuffer数组
+                    }
+                    // 将剩余数据保留
+                    last_remaining_buffer.clear(); // 清空元素，buffer.size() = 0;
+                    last_remaining_buffer.insert(last_remaining_buffer.end(), cat_buffer.begin() + i + 44, cat_buffer.end()); // 合并两个vector，两帧拼接
+                    // std::cout << "buffer: " <<last_remaining_buffer.size()<<std::endl; //打印last_remaining_buffer的长度
+                    return ;
+                }
+                
+            }
+            else
+                // 如果不存在完整帧，则将剩余数据保存
+                last_remaining_buffer.clear();
+                last_remaining_buffer.insert(last_remaining_buffer.end(), cat_buffer.begin(), cat_buffer.end()); // 合并两个vector，两帧拼接
+                return ;
+        }
+    }
+    
+     // 合并两个vector，两帧拼接
+    // 没找到包头，将最后两个字节数据保留，防止漏掉帧头
+    if(i == data_len-5){
+        last_remaining_buffer.clear();
+        last_remaining_buffer.insert(last_remaining_buffer.end(), cat_buffer[i+1], cat_buffer[i+2]);
+        return ;
+    }
+}
